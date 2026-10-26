@@ -77,6 +77,17 @@ python -m aicn test -p gateway -m 模型名 -k 网关Key --base-url http://你�
 python -m aicn gen -t codex -p gateway -m 模型名 --base-url http://你的网关/v1 --write
 ```
 
+## 🖥️ Web 面板 · Web Panel
+
+不想记参数?一条命令启动本地浏览器面板,点按钮完成查询 / 连通测试 / 生成配置 / 环境体检:
+
+```bash
+python -m aicn web            # 默认 http://127.0.0.1:8787
+python -m aicn web --port 9000
+```
+
+面板与命令行复用同一套函数,行为完全一致;密钥只在浏览器与本进程内存之间传递,不落盘。姊妹项目 llmbench-cn 自带对应面板(默认 8788),两个面板页首可互跳。
+
 ## 🧰 命令一览 · Commands
 
 | 命令 / Command | 作用 / What it does | 示例 / Example |
@@ -86,6 +97,7 @@ python -m aicn gen -t codex -p gateway -m 模型名 --base-url http://你的网�
 | `aicn gen -t <tool> -p <p> -m <m> [--base-url 网关] [--write]` | 生成/写入工具配置 / generate config | `aicn gen -t codex -p qwen --write` |
 | `aicn env -p <p>` | 密钥环境变量命令 / env var commands | `aicn env deepseek` |
 | `aicn doctor` | 环境体检 / full checkup | `aicn doctor` |
+| `aicn web [--port 8787] [--no-open]` | 本地 Web 面板 / local web panel | `python -m aicn web` |
 
 ## 🔀 工具支持矩阵 · Tool Matrix
 

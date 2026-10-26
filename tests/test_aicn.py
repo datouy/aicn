@@ -170,3 +170,34 @@ def argparse_namespace(**kwargs):
 if __name__ == "__main__":
     unittest.main()
 
+
+
+class TestWeb(unittest.TestCase):
+    """web 面板基础可用性:页面与 /api/providers。"""
+
+    def test_parser_has_web(self):
+        from aicn import cli
+        ns = cli.build_parser().parse_args(["web", "--port", "0", "--no-open"])
+        self.assertEqual(ns.command, "web")
+        self.assertEqual(ns.port, 0)
+
+    def test_page_and_providers_api(self):
+        import threading
+        import urllib.request
+        from aicn import webui
+        webui.Handler.port = 0
+        srv = webui.ThreadingHTTPServer(("127.0.0.1", 0), webui.Handler)
+        port = srv.server_address[1]
+        th = threading.Thread(target=srv.serve_forever, daemon=True)
+        th.start()
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:%d/" % port, timeout=5) as r:
+                self.assertEqual(r.status, 200)
+                self.assertIn("aicn", r.read().decode("utf-8"))
+            with urllib.request.urlopen("http://127.0.0.1:%d/api/providers" % port, timeout=5) as r:
+                data = json.loads(r.read().decode("utf-8"))
+                self.assertTrue(data["ok"])
+                self.assertIn("deepseek", data["providers"])
+        finally:
+            srv.shutdown()
+            srv.server_close()

@@ -201,3 +201,57 @@ class TestWeb(unittest.TestCase):
         finally:
             srv.shutdown()
             srv.server_close()
+
+
+class TestCategoryData(unittest.TestCase):
+    def test_category_field(self):
+        data = aicn.load_providers()
+        for pid, p in data["providers"].items():
+            self.assertIn("category", p, "provider %s 缺少 category" % pid)
+
+
+class TestWebSync(unittest.TestCase):
+    """web 面板 /api/sync:临时数据文件 + mock /models 端点。"""
+
+    def test_api_sync_merges_models(self):
+        import http.server
+        import threading
+        import urllib.request
+        from aicn import webui
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                body = json.dumps({"data": [{"id": "mock-model"}]}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                df = Path(td) / "providers.json"
+                df.write_text(json.dumps(aicn.load_providers(), ensure_ascii=False),
+                              encoding="utf-8")
+                res = webui.api_sync(
+                    {"provider": "deepseek", "key": "k",
+                     "base_url": "http://127.0.0.1:%d/v1" % srv.server_address[1]},
+                    data_file=df)
+                self.assertTrue(res["ok"], res)
+                self.assertEqual(res["added"], ["mock-model"])
+                merged = json.loads(df.read_text(encoding="utf-8"))
+                self.assertEqual([m["id"] for m in merged["providers"]["deepseek"]["models"]],
+                                 ["mock-model"])
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_api_sync_unknown_provider(self):
+        from aicn import webui
+        res = webui.api_sync({"provider": "no-such-provider"})
+        self.assertFalse(res["ok"])

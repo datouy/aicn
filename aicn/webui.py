@@ -10,9 +10,11 @@ import argparse
 import contextlib
 import io
 import json
+import os
 import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 from . import cli
 
@@ -36,6 +38,7 @@ pre,.out{background:#010409;border:1px solid var(--line);border-radius:8px;paddi
 table{width:100%;border-collapse:collapse;font-size:12.5px;margin-top:10px}
 th,td{border:1px solid var(--line);padding:6px 8px;text-align:left}th{color:var(--dim);font-weight:600}
 .hint{color:var(--dim);font-size:12px;margin-top:8px}
+.hidden{display:none}
 </style></head><body>
 <h1>aicn <span style="color:var(--acc)">Web 面板</span></h1>
 <div class="sub">国产大模型一键接入 Codex / Claude Code / Cursor / Cline · 零依赖 · 端口 __PORT__ · 姊妹项目:<a href="__LLMBENCH_URL__" target="_blank">llmbench-cn 面板</a></div>
@@ -48,7 +51,7 @@ th,td{border:1px solid var(--line);padding:6px 8px;text-align:left}th{color:var(
 <div class="card">
 <h2>② 连通测试</h2>
 <label>供应商</label><select id="t-provider"></select>
-<label>模型(留空用默认)</label><input id="t-model" placeholder="如 deepseek-chat">
+<label>模型</label><div class="row2"><select id="t-model"></select><input id="t-model-custom" class="hidden" placeholder="输入模型名,如 deepseek-chat"></div>
 <div class="row2"><div><label>协议</label><select id="t-protocol"><option value="chat">chat</option><option value="responses">responses</option><option value="anthropic">anthropic</option></select></div>
 <div><label>API Key(可选)</label><input id="t-key" type="password" placeholder="仅本次请求内存"></div></div>
 <label>覆盖 base_url(可选)</label><input id="t-base" placeholder="如 http://127.0.0.1:8799/v1">
@@ -61,7 +64,7 @@ th,td{border:1px solid var(--line);padding:6px 8px;text-align:left}th{color:var(
 <h2>③ 生成接入配置</h2>
 <label>目标工具</label><select id="g-tool"><option value="codex">Codex</option><option value="claude-code">Claude Code</option><option value="cursor">Cursor</option><option value="cline">Cline</option></select>
 <label>供应商</label><select id="g-provider"></select>
-<label>模型(留空用默认)</label><input id="g-model" placeholder="如 qwen-plus">
+<label>模型</label><div class="row2"><select id="g-model"></select><input id="g-model-custom" class="hidden" placeholder="输入模型名,如 qwen-plus"></div>
 <label>API Key(仅 claude-code 会写入)</label><input id="g-key" type="password">
 <label>wire_api(仅 Codex 生效)</label><select id="g-wire"><option value="responses">responses(默认,推荐)</option><option value="chat">chat(仅旧版)</option></select>
 <label>覆盖 base_url(可选)</label><input id="g-base" placeholder="如 http://106.55.225.14/v1">
@@ -70,12 +73,22 @@ th,td{border:1px solid var(--line);padding:6px 8px;text-align:left}th{color:var(
 <div id="gen-out"></div>
 </div>
 <div class="card">
-<h2>④ 环境体检 doctor</h2>
+<h2>④ 同步模型(/models)</h2>
+<label>供应商</label><select id="s-provider"></select>
+<label>覆盖 base_url(可选)</label><input id="s-base" placeholder="留空用该供应商默认地址">
+<label>API Key(可选,缺省读环境变量)</label><input id="s-key" type="password">
+<button class="primary" onclick="runSync()">拉取 /models 并更新数据文件</button>
+<button class="okbtn" onclick="fillSyncMock()">填入本地 mock 网关</button>
+<div id="sync-out"></div>
+<div class="hint">向所选供应商的 <code>/models</code> 发起 GET 请求,把返回的模型合并进 <code>providers.json</code>(原价格信息按 id 保留,写入前自动备份 .bak)。大厂上新后在这里一键同步。</div>
+</div>
+<div class="card">
+<h2>⑤ 环境体检 doctor</h2>
 <button class="primary" onclick="runDoctor()">开始体检(探测 9 家公网端点)</button>
 <div id="doctor-out"></div>
 </div>
 <div class="card">
-<h2>⑤ 密钥环境变量命令</h2>
+<h2>⑥ 密钥环境变量命令</h2>
 <label>供应商</label><select id="e-provider"></select>
 <button onclick="runEnv()">查看命令</button>
 <div id="env-out"></div>
@@ -85,16 +98,38 @@ th,td{border:1px solid var(--line);padding:6px 8px;text-align:left}th{color:var(
 const $=s=>document.getElementById(s);
 async function api(path,body){const r=await fetch('/api/'+path,{method:body?'POST':'GET',headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});return r.json()}
 function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
-function render(el,obj,prefix){const pre=document.createElement('pre');let t='';if(obj.error)t+='错误: '+obj.error+'\n';if(obj.exit&&obj.exit!==0)t+='[退出码 '+obj.exit+']\n';if(obj.note)t+=obj.note+'\n';pre.textContent=t+(obj.out||'(无输出)');el.innerHTML='';el.appendChild(pre)}
-async function loadProviders(){const r=await api('providers');['t-provider','g-provider','e-provider'].forEach(id=>{const e=$(id);e.innerHTML='';Object.keys(r.providers||{}).forEach(p=>{const o=document.createElement('option');o.value=p;o.textContent=p;e.appendChild(o)})})}
+function render(el,obj){const pre=document.createElement('pre');let t='';if(obj.error)t+='错误: '+obj.error+'\n';if(obj.exit&&obj.exit!==0)t+='[退出码 '+obj.exit+']\n';if(obj.note)t+=obj.note+'\n';pre.textContent=t+(obj.out||'(无输出)');el.innerHTML='';el.appendChild(pre)}
+let PROV={};
+function fillProviderSelect(sel){const cats={};Object.keys(PROV).forEach(p=>{const c=PROV[p].category||'其他';(cats[c]=cats[c]||[]).push(p)});
+const order=['国产直连','聚合平台','海外官方','自建网关','其他'];let h='';
+order.filter(c=>cats[c]).forEach(c=>{h+='<optgroup label="'+esc(c)+'">'+cats[c].map(p=>'<option value="'+esc(p)+'">'+esc(PROV[p].cn||PROV[p].name||p)+'('+esc(p)+')</option>').join('')+'</optgroup>'});
+sel.innerHTML=h}
+function fillModelSelect(sel,pid){const p=PROV[pid]||{};const ms=p.models||[];let h='<option value="">(默认第一个)</option>';
+if(ms.length){const fams={};ms.forEach(m=>{const fam=(String(m.id).split(/[-\/.]/)[0]||'other').toUpperCase();(fams[fam]=fams[fam]||[]).push(m)});
+const keys=Object.keys(fams);
+if(keys.length>1){keys.forEach(f=>{h+='<optgroup label="'+esc(f)+'">'+fams[f].map(m=>'<option value="'+esc(m.id)+'">'+esc(m.id)+(m.input!=null?(' · ¥'+m.input):'')+'</option>').join('')+'</optgroup>'})}
+else{ms.forEach(m=>{h+='<option value="'+esc(m.id)+'">'+esc(m.id)+(m.input!=null?(' · ¥'+m.input):'')+'</option>'})}}
+h+='<option value="__custom__">✏️ 自定义…</option>';sel.innerHTML=h}
+function modelValue(pid,selId,customId){const sel=$(selId);return sel.value==='__custom__'?($(customId).value||null):(sel.value||null)}
+function bindModel(selId,customId,pidFn){$(selId).addEventListener('change',()=>{$(customId).classList.toggle('hidden',$(selId).value!=='__custom__')});}
+async function loadProviders(){const r=await api('providers');PROV=r.providers||{};
+['t-provider','g-provider','s-provider','e-provider'].forEach(id=>fillProviderSelect($(id)));
+['t-provider','g-provider'].forEach(id=>{$(id).addEventListener('change',()=>{const p=$(id).value;fillModelSelect($(id==='t-provider'?'t-model':'g-model'),p)})});
+fillModelSelect($('t-model'),$('t-provider').value);fillModelSelect($('g-model'),$('g-provider').value)}
 async function loadList(){const r=await api('list',{});if(!r.ok){render($('list-box'),r);return}
 const rows=(r.data&&r.data.rows)||[];let h='<table><tr><th>供应商</th><th>模型</th><th>输入/输出(1M)</th><th>上下文</th><th>协议</th><th>说明</th></tr>';
 rows.forEach(x=>{h+='<tr><td>'+esc(x.provider)+'</td><td>'+esc(x.model)+'</td><td>'+esc(x.price)+'</td><td>'+esc(x.context)+'</td><td>'+esc(x.protocols)+'</td><td>'+esc(x.desc)+'</td></tr>'});
 h+='</table><div class="hint">价格更新:'+esc((r.data&&r.data.price_updated)||'-')+' · 仅作参考,以官方定价页为准</div>';
 $('list-box').innerHTML=h}
-function fillMock(){$('t-provider').value='gateway';$('t-model').value='mock-model';$('t-key').value='mock-key';$('t-base').value='http://127.0.0.1:8799/v1'}
-async function runTest(){$('test-out').innerHTML='<pre>运行中...</pre>';const r=await api('test',{provider:$('t-provider').value,model:$('t-model').value,key:$('t-key').value,protocol:$('t-protocol').value,base_url:$('t-base').value});render($('test-out'),r)}
-async function runGen(){const r=await api('gen',{tool:$('g-tool').value,provider:$('g-provider').value,model:$('g-model').value,key:$('g-key').value,wire_api:$('g-wire').value,base_url:$('g-base').value,write:$('g-write').checked});render($('gen-out'),r)}
+function fillMock(){$('t-provider').value='gateway';fillModelSelect($('t-model'),'gateway');$('t-key').value='mock-key';$('t-base').value='http://127.0.0.1:8799/v1'}
+function fillSyncMock(){$('s-provider').value='gateway';$('s-base').value='http://127.0.0.1:8799/v1';$('s-key').value='mock-key'}
+async function runTest(){$('test-out').innerHTML='<pre>运行中...</pre>';
+const r=await api('test',{provider:$('t-provider').value,model:modelValue($('t-provider').value,'t-model','t-model-custom'),key:$('t-key').value,protocol:$('t-protocol').value,base_url:$('t-base').value});render($('test-out'),r)}
+async function runGen(){const r=await api('gen',{tool:$('g-tool').value,provider:$('g-provider').value,model:modelValue($('g-provider').value,'g-model','g-model-custom'),key:$('g-key').value,wire_api:$('g-wire').value,base_url:$('g-base').value,write:$('g-write').checked});render($('gen-out'),r)}
+async function runSync(){$('sync-out').innerHTML='<pre>运行中...</pre>';
+const r=await api('sync',{provider:$('s-provider').value,base_url:$('s-base').value,key:$('s-key').value});
+if(r.ok){let h='<pre>✓ 已写入 providers.json(原文件备份 .bak)\n端点: '+esc(r.url)+'\n模型数: '+r.count+'\n新增: '+(r.added.length?r.added.join(', '):'(无)')+'\n移除: '+(r.removed.length?r.removed.join(', '):'(无)')+'</pre>';
+$('sync-out').innerHTML=h;await loadProviders()}else{render($('sync-out'),r)}}
 async function runDoctor(){$('doctor-out').innerHTML='<pre>运行中(约 10-30 秒)...</pre>';const r=await api('doctor',{});render($('doctor-out'),r)}
 async function runEnv(){const r=await api('env',{provider:$('e-provider').value});render($('env-out'),r)}
 loadProviders();loadList();
@@ -164,6 +199,41 @@ def api_gen(body: dict) -> dict:
     return _run(cli.cmd_gen, ns)
 
 
+def api_sync(body: dict, data_file=None) -> dict:
+    """从供应商/网关的 /models 拉取模型列表并合并进 providers.json。"""
+    data = cli.load_providers()
+    pid = body.get("provider") or ""
+    if pid not in data["providers"]:
+        return {"ok": False, "error": "未知供应商: %s(可用: %s)" % (pid, ", ".join(data["providers"]))}
+    provider = data["providers"][pid]
+    base = (body.get("base_url") or provider.get("base_url") or "").rstrip("/")
+    if not base:
+        return {"ok": False, "error": "该供应商没有默认 base_url,请填写网关地址"}
+    url = base + "/models"
+    key = body.get("key") or cli.read_key(provider, None) or ""
+    headers = {"Authorization": "Bearer " + key} if key else {}
+    status, ms, raw = cli.http_request(url, "GET", headers, None, timeout=15)
+    if status != 200:
+        return {"ok": False, "error": "HTTP %s(%dms): %s" % (status, ms, (raw or "")[:200])}
+    try:
+        ids = [str(m["id"]) for m in json.loads(raw).get("data", []) if m.get("id")]
+    except Exception as exc:
+        return {"ok": False, "error": "解析 /models 响应失败: %s" % exc}
+    if not ids:
+        return {"ok": False, "error": "端点未返回任何模型: " + url}
+    old = {m["id"]: m for m in provider.get("models", [])}
+    models = [old.get(mid) or {"id": mid, "input": None, "output": None,
+                               "cache_hit_input": None, "context": None,
+                               "desc": "从 /models 同步(价格待补充)"}
+              for mid in ids]
+    provider["models"] = models
+    path = Path(data_file) if data_file else cli.DATA_FILE
+    cli.write_with_backup(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    return {"ok": True, "url": url, "count": len(models),
+            "added": [i for i in ids if i not in old],
+            "removed": [i for i in old if i not in ids]}
+
+
 def api_doctor(body: dict) -> dict:
     return _run(cli.cmd_doctor, argparse.Namespace())
 
@@ -172,14 +242,14 @@ def api_env(body: dict) -> dict:
     return _run(cli.cmd_env, argparse.Namespace(provider=body.get("provider") or ""))
 
 
-API = {"list": api_list, "test": api_test, "gen": api_gen,
+API = {"list": api_list, "test": api_test, "gen": api_gen, "sync": api_sync,
        "doctor": api_doctor, "env": api_env}
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "aicn-web/0.1"
+    server_version = "aicn-web/0.2"
     port = 8787
-    llmbench_url = "http://127.0.0.1:8788/"
+    llmbench_url = "http://127.0.0.1:8789/"
 
     def log_message(self, *args):
         pass
@@ -230,7 +300,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def cmd_web(args: argparse.Namespace) -> int:
     Handler.port = args.port
-    Handler.llmbench_url = getattr(args, "llmbench_url", None) or "http://127.0.0.1:8788/"
+    Handler.llmbench_url = getattr(args, "llmbench_url", None) or "http://127.0.0.1:8789/"
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     url = "http://%s:%d/" % (args.host, srv.server_address[1])
     print("aicn Web 面板:%s(Ctrl+C 停止)" % url)

@@ -22,7 +22,8 @@ class TestProvidersData(unittest.TestCase):
             for field in ("name", "site", "base_url", "env_key", "models"):
                 self.assertIn(field, p, "provider %s 缺少字段 %s" % (pid, field))
             self.assertIn(p.get("currency", "CNY"), ("CNY", "USD"))
-            self.assertTrue(p["models"], "provider %s 没有模型" % pid)
+            if pid != "gateway":
+                self.assertTrue(p["models"], "provider %s 没有模型" % pid)
 
     def test_model_ids_unique(self):
         for pid, p in self.data["providers"].items():
@@ -168,3 +169,4 @@ def argparse_namespace(**kwargs):
 
 if __name__ == "__main__":
     unittest.main()
+

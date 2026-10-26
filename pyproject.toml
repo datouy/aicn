@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aicn"
+version = "0.1.0"
+description = "让国产大模型一键接入 AI 编程工具(Codex / Claude Code / Cursor / Cline)的零依赖 CLI"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [{name = "datouy"}]
+keywords = ["llm", "codex", "claude-code", "cursor", "deepseek", "qwen", "glm", "kimi", "cli", "chinese"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Software Development :: Build Tools",
+]
+
+[project.scripts]
+aicn = "aicn.cli:main"
+
+[tool.setuptools]
+packages = ["aicn"]
+
+[tool.setuptools.package-data]
+aicn = ["data/*.json"]

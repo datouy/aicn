@@ -59,6 +59,16 @@ def load_providers() -> dict:
     return data
 
 
+def staleness_months(updated: str) -> int | None:
+    """从 '2026-10' 计算距今月数;无法解析返回 None。"""
+    try:
+        year, month = (int(x) for x in updated.split("-")[:2])
+        now = time.localtime()
+        return (now.tm_year - year) * 12 + (now.tm_mon - month)
+    except Exception:
+        return None
+
+
 def require_provider(data: dict, provider_id: str) -> dict:
     providers = data["providers"]
     if provider_id not in providers:
@@ -134,6 +144,13 @@ def cmd_list(args) -> str:
     rows = []
     for pid, p in providers.items():
         currency = p.get("currency", "CNY")
+        if not p.get("models"):
+            rows.append({
+                "provider": pid, "name": p.get("name", pid), "cn": p.get("cn", ""),
+                "model": "(无内置模型)", "price": "—",
+                "context": "-", "protocols": "/".join(provider_protocols(p)),
+                "desc": "用 -m 指定模型名,或用 llmbench refresh 导入网关 /models",
+            })
         for m in p.get("models", []):
             price_in = format_price(m.get("input"), currency)
             price_out = format_price(m.get("output"), currency)
@@ -163,6 +180,9 @@ def cmd_list(args) -> str:
     lines.append("协议说明：chat=OpenAI Chat 兼容 / anthropic=Anthropic 兼容 / responses=Responses 兼容（? 表示未官方确认）。")
     lines.append("价格更新于 %s，仅作参考，以官方定价页为准。%s" % (
         data.get("price_updated", "未知"), ""))
+    months = staleness_months(data.get("price_updated", ""))
+    if months is not None and months > 3:
+        lines.append("⚠️ 价格数据已 %d 个月未更新，请 PR 更新 %s。" % (months, DATA_FILE))
     lines.append("模型价格可 PR 更新：%s" % DATA_FILE)
     return "\n".join(lines)
 
@@ -375,7 +395,9 @@ def cline_guide(provider: dict, model: str) -> str:
 
 def cmd_gen(args) -> str:
     data = load_providers()
-    provider = require_provider(data, args.provider)
+    provider = dict(require_provider(data, args.provider))
+    if getattr(args, "base_url", None):
+        provider["base_url"] = args.base_url
     model = pick_model(provider, args.model)
     lines = []
 
@@ -405,7 +427,7 @@ def cmd_gen(args) -> str:
             lines.append("已写入 %s" % path)
 
     elif args.tool == "claude-code":
-        base = provider.get("anthropic_base_url")
+        base = provider.get("anthropic_base_url") or (args.base_url if getattr(args, "base_url", None) else None)
         if not base:
             lines.append("%s 未收录 Anthropic 兼容端点，Claude Code 需要 Anthropic 协议。" % provider["name"])
             lines.append("可用替代方案：")
@@ -565,6 +587,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_gen.add_argument("--write", action="store_true", help="真正写入配置文件（默认 dry-run）")
     p_gen.add_argument("--wire-api", choices=["responses", "chat"],
                        help="仅 codex：协议（默认 responses；chat 仅旧版）")
+    p_gen.add_argument("--base-url", help="覆盖 base URL（如指向本地/自建网关）")
 
     p_env = sub.add_parser("env", help="查看密钥环境变量设置命令")
     p_env.add_argument("--provider", "-p", required=True)
@@ -598,3 +621,5 @@ def main(argv: list | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+

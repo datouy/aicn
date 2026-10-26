@@ -1,0 +1,11 @@
+// Claude Code settings.json 示例（由 aicn gen --tool claude-code 生成）
+// 路径：~/.claude/settings.json
+// 密钥也可以直接用环境变量 ANTHROPIC_AUTH_TOKEN 提供，避免落盘
+
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://api.moonshot.cn/anthropic",
+    "ANTHROPIC_AUTH_TOKEN": "请替换为你的 API Key",
+    "ANTHROPIC_MODEL": "kimi-latest"
+  }
+}

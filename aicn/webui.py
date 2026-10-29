@@ -7,10 +7,7 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
-import io
 import json
-import os
 import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -80,7 +77,7 @@ th,td{border:1px solid var(--line);padding:6px 8px;text-align:left}th{color:var(
 <button class="primary" onclick="runSync()">拉取 /models 并更新数据文件</button>
 <button class="okbtn" onclick="fillSyncMock()">填入本地 mock 网关</button>
 <div id="sync-out"></div>
-<div class="hint">向所选供应商的 <code>/models</code> 发起 GET 请求,把返回的模型合并进 <code>providers.json</code>(原价格信息按 id 保留,写入前自动备份 .bak)。大厂上新后在这里一键同步。</div>
+<div class="hint">向所选供应商的 <code>/models</code> 发起 GET 请求,把返回的模型写入 <code>~/.aicn/providers.json</code>(原价格信息按 id 保留,写入前自动备份 .bak)。<b>不会修改安装包或仓库里的 <code>aicn/data/providers.json</code></b> —— 同步结果只在你本机生效。大厂上新后在这里一键同步。</div>
 </div>
 <div class="card">
 <h2>⑤ 环境体检 doctor</h2>
@@ -97,21 +94,24 @@ th,td{border:1px solid var(--line);padding:6px 8px;text-align:left}th{color:var(
 <script>
 const $=s=>document.getElementById(s);
 async function api(path,body){const r=await fetch('/api/'+path,{method:body?'POST':'GET',headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});return r.json()}
-function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function render(el,obj){const pre=document.createElement('pre');let t='';if(obj.error)t+='错误: '+obj.error+'\n';if(obj.exit&&obj.exit!==0)t+='[退出码 '+obj.exit+']\n';if(obj.note)t+=obj.note+'\n';pre.textContent=t+(obj.out||'(无输出)');el.innerHTML='';el.appendChild(pre)}
 let PROV={};
 function fillProviderSelect(sel){const cats={};Object.keys(PROV).forEach(p=>{const c=PROV[p].category||'其他';(cats[c]=cats[c]||[]).push(p)});
 const order=['国产直连','聚合平台','海外官方','自建网关','其他'];let h='';
 order.filter(c=>cats[c]).forEach(c=>{h+='<optgroup label="'+esc(c)+'">'+cats[c].map(p=>'<option value="'+esc(p)+'">'+esc(PROV[p].cn||PROV[p].name||p)+'('+esc(p)+')</option>').join('')+'</optgroup>'});
 sel.innerHTML=h}
-function fillModelSelect(sel,pid){const p=PROV[pid]||{};const ms=p.models||[];let h='<option value="">(默认第一个)</option>';
+function fillModelSelect(sel,pid){const p=PROV[pid]||{};const ms=p.models||[];const cur=(p.currency==='USD'?'$':'¥');
+function price(v){return v==null?'':cur+(typeof v==='number'?v.toFixed(2):v)}
+let h='<option value="">(默认第一个)</option>';
 if(ms.length){const fams={};ms.forEach(m=>{const fam=(String(m.id).split(/[-\/.]/)[0]||'other').toUpperCase();(fams[fam]=fams[fam]||[]).push(m)});
 const keys=Object.keys(fams);
-if(keys.length>1){keys.forEach(f=>{h+='<optgroup label="'+esc(f)+'">'+fams[f].map(m=>'<option value="'+esc(m.id)+'">'+esc(m.id)+(m.input!=null?(' · ¥'+m.input):'')+'</option>').join('')+'</optgroup>'})}
-else{ms.forEach(m=>{h+='<option value="'+esc(m.id)+'">'+esc(m.id)+(m.input!=null?(' · ¥'+m.input):'')+'</option>'})}}
-h+='<option value="__custom__">✏️ 自定义…</option>';sel.innerHTML=h}
-function modelValue(pid,selId,customId){const sel=$(selId);return sel.value==='__custom__'?($(customId).value||null):(sel.value||null)}
-function bindModel(selId,customId,pidFn){$(selId).addEventListener('change',()=>{$(customId).classList.toggle('hidden',$(selId).value!=='__custom__')});}
+if(keys.length>1){keys.forEach(f=>{h+='<optgroup label="'+esc(f)+'">'+fams[f].map(m=>'<option value="'+esc(m.id)+'">'+esc(m.id)+(m.input!=null?(' · '+esc(price(m.input))):'')+'</option>').join('')+'</optgroup>'})}
+else{ms.forEach(m=>{h+='<option value="'+esc(m.id)+'">'+esc(m.id)+(m.input!=null?(' · '+esc(price(m.input))):'')+'</option>'})}}
+h+='<option value="__custom__">✏️ 自定义…</option>';sel.innerHTML=h;syncCustomInput(sel)}
+function syncCustomInput(sel){const inp=$(sel.id+'-custom');if(inp)inp.classList.toggle('hidden',sel.value!=='__custom__')}
+function bindModel(selId,customId){const sel=$(selId);sel.addEventListener('change',()=>{$(customId).classList.toggle('hidden',sel.value!=='__custom__')})}
+function modelValue(selId,customId){const sel=$(selId);return sel.value==='__custom__'?($(customId).value||null):(sel.value||null)}
 async function loadProviders(){const r=await api('providers');PROV=r.providers||{};
 ['t-provider','g-provider','s-provider','e-provider'].forEach(id=>fillProviderSelect($(id)));
 ['t-provider','g-provider'].forEach(id=>{$(id).addEventListener('change',()=>{const p=$(id).value;fillModelSelect($(id==='t-provider'?'t-model':'g-model'),p)})});
@@ -124,40 +124,53 @@ $('list-box').innerHTML=h}
 function fillMock(){$('t-provider').value='gateway';fillModelSelect($('t-model'),'gateway');$('t-key').value='mock-key';$('t-base').value='http://127.0.0.1:8799/v1'}
 function fillSyncMock(){$('s-provider').value='gateway';$('s-base').value='http://127.0.0.1:8799/v1';$('s-key').value='mock-key'}
 async function runTest(){$('test-out').innerHTML='<pre>运行中...</pre>';
-const r=await api('test',{provider:$('t-provider').value,model:modelValue($('t-provider').value,'t-model','t-model-custom'),key:$('t-key').value,protocol:$('t-protocol').value,base_url:$('t-base').value});render($('test-out'),r)}
-async function runGen(){const r=await api('gen',{tool:$('g-tool').value,provider:$('g-provider').value,model:modelValue($('g-provider').value,'g-model','g-model-custom'),key:$('g-key').value,wire_api:$('g-wire').value,base_url:$('g-base').value,write:$('g-write').checked});render($('gen-out'),r)}
+const r=await api('test',{provider:$('t-provider').value,model:modelValue('t-model','t-model-custom'),key:$('t-key').value,protocol:$('t-protocol').value,base_url:$('t-base').value});render($('test-out'),r)}
+async function runGen(){const r=await api('gen',{tool:$('g-tool').value,provider:$('g-provider').value,model:modelValue('g-model','g-model-custom'),key:$('g-key').value,wire_api:$('g-wire').value,base_url:$('g-base').value,write:$('g-write').checked});render($('gen-out'),r)}
 async function runSync(){$('sync-out').innerHTML='<pre>运行中...</pre>';
 const r=await api('sync',{provider:$('s-provider').value,base_url:$('s-base').value,key:$('s-key').value});
-if(r.ok){let h='<pre>✓ 已写入 providers.json(原文件备份 .bak)\n端点: '+esc(r.url)+'\n模型数: '+r.count+'\n新增: '+(r.added.length?r.added.join(', '):'(无)')+'\n移除: '+(r.removed.length?r.removed.join(', '):'(无)')+'</pre>';
+if(r.ok){let h='<pre>✓ 已写入用户数据文件(原文件备份 .bak)\n端点: '+esc(r.url)+'\n写入: '+esc(r.path||'')+'\n模型数: '+r.count+'\n新增: '+(r.added.length?r.added.map(esc).join(', '):'(无)')+'\n移除: '+(r.removed.length?r.removed.map(esc).join(', '):'(无)')+'</pre>';
 $('sync-out').innerHTML=h;await loadProviders()}else{render($('sync-out'),r)}}
 async function runDoctor(){$('doctor-out').innerHTML='<pre>运行中(约 10-30 秒)...</pre>';const r=await api('doctor',{});render($('doctor-out'),r)}
 async function runEnv(){const r=await api('env',{provider:$('e-provider').value});render($('env-out'),r)}
+bindModel('t-model','t-model-custom');bindModel('g-model','g-model-custom');
 loadProviders();loadList();
 </script></body></html>"""
 
 
 def _run(fn, ns) -> dict:
-    """在线程中执行 cli 命令函数,捕获 stdout/stderr 与 SystemExit。"""
-    out_buf, err_buf = io.StringIO(), io.StringIO()
-    box = {}
+    """在线程中执行 cli 命令函数，捕获异常与退出码。
+
+    不使用 contextlib.redirect_stdout —— 那会改写进程级全局的 sys.stdout，
+    在 ThreadingHTTPServer 的并发请求下会把 A 请求的输出（含密钥）串到 B 响应里。
+    cli 的命令函数一律以返回值传递文本，副作用（写文件）由调用方处理。
+    """
+    box: dict = {}
 
     def worker():
         try:
-            with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
-                box["out"] = fn(ns) or ""
+            # 不要写成 `fn(ns) or ""`：空文本的 CommandOutput 会被当成假值，
+            # 退化成普通 str 从而丢掉 exit_code（失败却返回 0）。
+            result = fn(ns)
+            box["out"] = result if result is not None else ""
+            box["exit"] = getattr(box["out"], "exit_code", 0)
+        except cli.AicnError as exc:
+            box["error"] = str(exc)
+            box["exit"] = exc.code
         except SystemExit as exc:
             box["exit"] = exc.code or 0
         except Exception as exc:
             box["error"] = "%s: %s" % (type(exc).__name__, exc)
+            box["exit"] = 1
 
     th = threading.Thread(target=worker, daemon=True)
     th.start()
     th.join(timeout=600)
     if th.is_alive():
         box["note"] = "任务仍在后台执行,超 600s 未返回。"
-    out = out_buf.getvalue() + err_buf.getvalue() + box.get("out", "")
-    return {"ok": box.get("error") is None and box.get("exit", 0) == 0,
-            "exit": box.get("exit", 0), "error": box.get("error", ""),
+    out = str(box.get("out", ""))
+    exit_code = box.get("exit", 0)
+    return {"ok": box.get("error") is None and exit_code == 0,
+            "exit": exit_code, "error": box.get("error", ""),
             "note": box.get("note", ""), "out": out.strip()}
 
 
@@ -200,38 +213,23 @@ def api_gen(body: dict) -> dict:
 
 
 def api_sync(body: dict, data_file=None) -> dict:
-    """从供应商/网关的 /models 拉取模型列表并合并进 providers.json。"""
-    data = cli.load_providers()
+    """从供应商/网关的 /models 拉取模型列表并写入用户级数据文件。
+
+    不再直接改包内 / 仓库里的 providers.json —— 那是 site-packages 或你的
+    源码目录，写坏了会污染全局安装环境或误提交到 git。
+    """
     pid = body.get("provider") or ""
-    if pid not in data["providers"]:
-        return {"ok": False, "error": "未知供应商: %s(可用: %s)" % (pid, ", ".join(data["providers"]))}
-    provider = data["providers"][pid]
-    base = (body.get("base_url") or provider.get("base_url") or "").rstrip("/")
-    if not base:
-        return {"ok": False, "error": "该供应商没有默认 base_url,请填写网关地址"}
-    url = base + "/models"
-    key = body.get("key") or cli.read_key(provider, None) or ""
-    headers = {"Authorization": "Bearer " + key} if key else {}
-    status, ms, raw = cli.http_request(url, "GET", headers, None, timeout=15)
-    if status != 200:
-        return {"ok": False, "error": "HTTP %s(%dms): %s" % (status, ms, (raw or "")[:200])}
+    key = body.get("key") or ""
     try:
-        ids = [str(m["id"]) for m in json.loads(raw).get("data", []) if m.get("id")]
+        res = cli.sync_models(pid, body.get("base_url") or None,
+                              key or None,
+                              Path(data_file) if data_file else None)
     except Exception as exc:
-        return {"ok": False, "error": "解析 /models 响应失败: %s" % exc}
-    if not ids:
-        return {"ok": False, "error": "端点未返回任何模型: " + url}
-    old = {m["id"]: m for m in provider.get("models", [])}
-    models = [old.get(mid) or {"id": mid, "input": None, "output": None,
-                               "cache_hit_input": None, "context": None,
-                               "desc": "从 /models 同步(价格待补充)"}
-              for mid in ids]
-    provider["models"] = models
-    path = Path(data_file) if data_file else cli.DATA_FILE
-    cli.write_with_backup(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
-    return {"ok": True, "url": url, "count": len(models),
-            "added": [i for i in ids if i not in old],
-            "removed": [i for i in old if i not in ids]}
+        return {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+    if not res["ok"]:
+        return res
+    return {"ok": True, "url": res["url"], "count": res["count"], "path": res["path"],
+            "added": res["added"], "removed": res["removed"]}
 
 
 def api_doctor(body: dict) -> dict:
@@ -247,7 +245,7 @@ API = {"list": api_list, "test": api_test, "gen": api_gen, "sync": api_sync,
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "aicn-web/0.2"
+    server_version = "aicn-web/" + cli.VERSION
     port = 8787
     llmbench_url = "http://127.0.0.1:8789/"
 

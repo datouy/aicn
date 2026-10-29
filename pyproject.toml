@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aicn"
-version = "0.1.0"
+dynamic = ["version"]
 description = "让国产大模型一键接入 AI 编程工具(Codex / Claude Code / Cursor / Cline)的零依赖 CLI"
 readme = "README.md"
 license = {text = "MIT"}
@@ -24,5 +24,23 @@ aicn = "aicn.cli:main"
 [tool.setuptools]
 packages = ["aicn"]
 
+[tool.setuptools.dynamic]
+# 版本号唯一来源：aicn/_version.py（与 CLI --version、README 徽章同源）
+version = {attr = "aicn._version.__version__"}
+
 [tool.setuptools.package-data]
 aicn = ["data/*.json"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+# 不启用 UP(UP031/UP009 等):本项目统一使用 %-格式化以兼容 Python 3.9，
+# 且保留 utf-8 声明以便在老工具链中保持一致。
+select = ["E", "F", "W", "I", "B"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试里大量使用中文与内联构造，允许部分宽松规则
+"tests/*" = ["E402"]

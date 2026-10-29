@@ -9,13 +9,19 @@
 | 更新模型价格 | `aicn/data/providers.json` | ❌ |
 | 新增供应商 | `aicn/data/providers.json` | ❌ |
 | 修 bug / 加命令 | `aicn/cli.py` | ✅ |
+| 改 Web 面板 | `aicn/webui.py` | ✅ |
 | 测试 | `tests/` | ✅ |
 
 ## 数据贡献(最常见)
 
 1. **更新价格**:找到对应供应商的 `models` 列表,修改 `input` / `output`(单位:¥ 或 $ / 1M tokens),同时更新顶层 `price_updated` 为当前年月;
-2. **新增供应商**:复制一个结构相似的条目,填 `name`、`cn`、`site`、`base_url`、`env_key`、`currency`、`note`,以及至少一个 `models` 条目;`responses_api` 填 `true` / `false` / `null`(null = 未确认);
-3. `anthropic_base_url`:仅当供应商提供 Anthropic 兼容端点(可接 Claude Code)时填写。
+2. **新增供应商**:复制一个结构相似的条目,填 `name`、`cn`、`site`、`base_url`、`env_key`、`currency`、`note`,以及至少一个 `models` 条目;
+3. `protocols`:显式列出该供应商**确实提供**的协议(`chat` / `responses` / `anthropic`),不要靠端点字段推断 —— 推断会把 Anthropic 官方这类原生协议端点误标成 `chat`;
+4. `unconfirmed_protocols`:官方未明确确认、但社区反馈可用的协议(展示时带 `?` 标记);
+5. `anthropic_base_url`:仅当供应商提供 Anthropic 兼容端点(可接 Claude Code)时填写。
+
+> `aicn/data/providers.json` 是**只读基线**,不要在同步模型时改动它 ——
+> `aicn sync` 的结果会写到 `~/.aicn/providers.json`,两者加载时合并。
 
 ## 代码贡献
 
@@ -23,6 +29,7 @@
 git clone https://github.com/datouy/aicn.git
 cd aicn
 python -m unittest discover -s tests -v   # 全部通过再提交
+ruff check aicn tests scripts              # 静态检查必须无告警
 ```
 
 - 保持**零第三方依赖**(标准库 only),除非有非常充分的理由;

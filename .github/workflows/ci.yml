@@ -6,12 +6,29 @@ on:
   pull_request:
 
 jobs:
-  test:
+  lint:
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 安装 ruff
+        run: pip install ruff
+      - name: 静态检查
+        run: ruff check aicn tests scripts
+
+  test:
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+        exclude:
+          # macOS runner 上 3.9 不可用
+          - os: macos-latest
+            python-version: "3.9"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,7 +37,12 @@ jobs:
       - name: 单元测试
         run: python -m unittest discover -s tests -v
       - name: 冒烟测试
+        # 用 python -c 丢弃输出：Windows runner 的默认 shell 是 PowerShell，
+        # `> /dev/null` 在 PowerShell 下会报「找不到路径 E:\dev\null」而失败。
         run: |
           python -m aicn --version
-          python -m aicn list --json > /dev/null
+          python -c "import aicn.cli as c; c.cmd_list(type('N',(),{'provider':None,'json':True})())"
           python -m aicn env deepseek
+          python -m aicn list -p deepseek
+          python -m aicn gen -t claude-code -p anthropic
+          python -m aicn doctor --help

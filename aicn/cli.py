@@ -15,15 +15,20 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import copy
 import json
 import os
 import re
 import shutil
+import socket
 import sys
+import tempfile
+import threading
 import time
 import unicodedata
 import urllib.error
 import urllib.request
+from functools import lru_cache
 from pathlib import Path
 
 try:
@@ -47,6 +52,10 @@ DATA_FILE = Path(__file__).resolve().parent / "data" / "providers.json"
 #: 不直接写包内的 DATA_FILE —— pip 安装后那是 site-packages，多半无写权限，
 #: 写坏了也会污染全局安装环境。
 USER_DATA_FILE = Path.home() / ".aicn" / "providers.json"
+
+#: 当前代码能解析的数据文件 schema 版本。providers.json 未来若升级 schema，
+#: 老版本 aicn 会在这里给出明确报错，而不是静默解析出错误结构。
+SUPPORTED_SCHEMA_VERSION = 1
 
 
 class AicnError(Exception):
@@ -78,14 +87,24 @@ if sys.platform == "win32":
         except Exception:
             pass
 
+#: 兜底 socket 超时：urllib 的 timeout 不覆盖系统 DNS 解析，设一个全局默认值，
+#: 避免某些平台上 getaddrinfo/连接阶段长时间无响应。
+socket.setdefaulttimeout(15)
+
 
 # --------------------------------------------------------------------------
 # 基础工具
 # --------------------------------------------------------------------------
 
+@lru_cache(maxsize=4096)
+def _char_width(ch: str) -> int:
+    """单个字符的终端显示宽度（中文等宽字符按 2 列）。"""
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
 def display_width(text: str) -> int:
     """按终端显示宽度计算（中文按 2 列）。"""
-    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in text)
+    return sum(_char_width(ch) for ch in text)
 
 
 def truncate(text: str, width: int) -> str:
@@ -97,7 +116,7 @@ def truncate(text: str, width: int) -> str:
     out = ""
     used = 0
     for ch in text:
-        w = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        w = _char_width(ch)
         if used + w > width - 1:
             break
         out += ch
@@ -122,20 +141,47 @@ def column_widths(rows: list[list[str]], headers: list[str],
     return widths
 
 
+#: 进程内缓存：load_providers 会被 CLI 与 Web 面板反复调用（doctor 并行探测、
+#: 每个 /api 请求各调一次）。按两个数据文件的 mtime 做失效判断，避免重复读盘 + 解析。
+_providers_cache: dict | None = None
+_providers_cache_key: tuple | None = None
+
+
+def _providers_mtime_key() -> tuple:
+    """返回 (DATA_FILE, USER_DATA_FILE) 的 mtime 快照，作为缓存失效键。"""
+    parts = []
+    for f in (DATA_FILE, USER_DATA_FILE):
+        try:
+            parts.append(f.stat().st_mtime_ns)
+        except OSError:
+            parts.append(None)
+    return tuple(parts)
+
+
 def load_providers() -> dict:
-    """加载供应商数据。
+    """加载供应商数据（带 mtime 缓存，返回独立副本）。
 
     以包内 DATA_FILE 为基线，再叠加用户级 USER_DATA_FILE（~/.aicn/providers.json）里
     同步来的模型列表。用户级文件只覆盖 model 条目，不改动价格等基线字段。
     """
+    global _providers_cache, _providers_cache_key
+    key = _providers_mtime_key()
+    if _providers_cache is not None and key == _providers_cache_key:
+        return copy.deepcopy(_providers_cache)
     if not DATA_FILE.exists():
         raise AicnError("找不到数据文件 %s" % DATA_FILE)
     with open(DATA_FILE, encoding="utf-8") as fh:
         data = json.load(fh)
+    schema = data.get("schema_version")
+    if schema is not None and schema != SUPPORTED_SCHEMA_VERSION:
+        raise AicnError("数据文件 schema_version=%s 与当前 aicn 支持的 %d 不兼容，请升级 aicn。"
+                        % (schema, SUPPORTED_SCHEMA_VERSION))
     overlay = load_user_overlay()
     if overlay:
         _apply_overlay(data, overlay)
-    return data
+    _providers_cache = data
+    _providers_cache_key = key
+    return copy.deepcopy(data)
 
 
 def load_user_overlay() -> dict:
@@ -191,7 +237,12 @@ def pick_model(provider: dict, model_id: str | None) -> str:
 def http_request(url: str, method: str = "GET", headers: dict | None = None,
                  body: dict | None = None, timeout: int = 15):
     payload = None if body is None else json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(url, data=payload, headers=headers or {}, method=method)
+    merged = dict(headers or {})
+    # 统一 UA / Accept：部分网关（OpenRouter / Anthropic / 企业 WAF）会拒绝或限流
+    # 默认的 Python-urllib UA。
+    merged.setdefault("User-Agent", "aicn/%s" % VERSION)
+    merged.setdefault("Accept", "application/json")
+    req = urllib.request.Request(url, data=payload, headers=merged, method=method)
     started = time.time()
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -284,11 +335,12 @@ def cmd_list(args) -> str:
     rows = []
     for pid, p in providers.items():
         currency = p.get("currency", "CNY")
+        protocols = "/".join(provider_protocols(p))
         if not p.get("models"):
             rows.append({
                 "provider": pid, "name": p.get("name", pid), "cn": p.get("cn", ""),
                 "model": "(无内置模型)", "price": "—",
-                "context": "-", "protocols": "/".join(provider_protocols(p)),
+                "context": "-", "protocols": protocols,
                 "desc": "用 -m 指定模型名,或用 llmbench refresh 导入网关 /models",
             })
         for m in p.get("models", []):
@@ -299,7 +351,7 @@ def cmd_list(args) -> str:
             rows.append({
                 "provider": pid, "name": p.get("name", pid), "cn": p.get("cn", ""),
                 "model": m["id"], "price": "%s / %s" % (price_in, price_out),
-                "context": m.get("context") or "-", "protocols": "/".join(provider_protocols(p)),
+                "context": m.get("context") or "-", "protocols": protocols,
                 "desc": m.get("desc") or "",
             })
 
@@ -504,34 +556,67 @@ def build_claude_settings(existing: str | None, base_url: str, model: str, key: 
     if not isinstance(env, dict):
         env = {}
     env["ANTHROPIC_BASE_URL"] = base_url
-    env["ANTHROPIC_AUTH_TOKEN"] = key or "请替换为你的 API Key"
+    if key:
+        env["ANTHROPIC_AUTH_TOKEN"] = key
+    else:
+        # 未传新 key 时保留已有 token，避免把用户已配好的密钥覆盖成占位符。
+        # 只有全新文件才写入占位符提示。
+        env.setdefault("ANTHROPIC_AUTH_TOKEN", "请替换为你的 API Key")
     if model:
         env["ANTHROPIC_MODEL"] = model
     data["env"] = env
     return json.dumps(data, ensure_ascii=False, indent=2) + "\n"
 
 
+#: 串行化所有写文件操作：Web 面板多线程并发下，两个请求同时写同一个配置文件
+#: 会互相覆盖，用一个进程内锁保证「备份 + 写入」是一个原子整体。
+_write_lock = threading.Lock()
+
+
 def write_with_backup(path: Path, content: str) -> str:
-    """写入文件（先备份原文件），返回一条人类可读的状态消息。
+    """原子地写入文件（先备份原文件），返回一条人类可读的状态消息。
 
     不直接 print —— Web 面板在多线程下调用本函数，直接 print 会与其它请求的
     输出交错（stdout 是进程级全局资源）。消息由调用方决定如何呈现。
 
-    写入失败（目录无写权限、磁盘满、路径被占用）时抛 AicnError 而不是裸的
-    OSError —— 否则 CLI 会打印一整屏 traceback，Web 面板也只能显示
+    先写同目录临时文件再 os.replace，避免进程崩溃/断电/并发写入留下半截文件；
+    并保留原文件权限。写入失败（目录无写权限、磁盘满、路径被占用）时抛 AicnError
+    而不是裸的 OSError —— 否则 CLI 会打印一整屏 traceback，Web 面板也只能显示
     "PermissionError: ..." 这种没有上下文的文本。
     """
     message = ""
-    try:
-        if path.exists():
-            backup = path.with_name(path.name + ".aicn.bak")
-            backup.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
-            message = "[备份] 原文件已备份到 %s" % backup
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
-    except OSError as err:
-        raise AicnError("写入 %s 失败：%s\n请检查该目录的写权限。" % (path, err),
-                        code=1) from err
+    with _write_lock:
+        try:
+            parent = path.parent
+            parent.mkdir(parents=True, exist_ok=True)
+            if path.exists():
+                backup = path.with_name(path.name + ".aicn.bak")
+                backup.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+                message = "[备份] 原文件已备份到 %s" % backup
+            # os.replace 会换 inode，需手动保留原文件权限（如 600），避免变成默认 umask。
+            mode = None
+            if path.exists():
+                try:
+                    mode = path.stat().st_mode & 0o7777
+                except OSError:
+                    mode = None
+            fd, tmp_name = tempfile.mkstemp(dir=str(parent), prefix=path.name + ".", suffix=".tmp")
+            os.close(fd)
+            tmp_path = Path(tmp_name)
+            try:
+                tmp_path.write_text(content, encoding="utf-8")
+                if mode is not None:
+                    os.chmod(tmp_name, mode)
+                os.replace(tmp_name, path)
+            except BaseException:
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+                raise
+        except OSError as err:
+            raise AicnError("写入 %s 失败：%s\n请检查该目录的写权限。" % (path, err),
+                            code=1) from err
     return message
 
 
@@ -804,7 +889,7 @@ def cmd_doctor(args) -> str:
     lines.append("")
     lines.append("--- 网络连通性（%s 个供应商端点）---" % len(data["providers"]))
     results = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(data["providers"]) or 1)) as pool:
         futures = {pool.submit(probe_endpoint, pid, p): pid
                    for pid, p in data["providers"].items()}
         for fut in concurrent.futures.as_completed(futures):

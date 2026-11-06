@@ -15,6 +15,10 @@ from pathlib import Path
 
 from . import cli
 
+#: POST 请求体上限（1MB）。面板只收几个表单字段，正常远小于此值；
+#: 限制是为了防止异常/恶意的大请求体占满内存。
+MAX_BODY = 1024 * 1024
+
 HTML = r"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>aicn · Web 面板</title>
@@ -285,7 +289,15 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"ok": False, "error": "unknown api: " + name})
             return
         try:
-            n = int(self.headers.get("Content-Length", 0))
+            raw_len = self.headers.get("Content-Length")
+            n = int(raw_len) if raw_len is not None else 0
+        except (TypeError, ValueError):
+            self._send(400, {"ok": False, "error": "bad content-length"})
+            return
+        if n < 0 or n > MAX_BODY:
+            self._send(413, {"ok": False, "error": "body too large"})
+            return
+        try:
             body = json.loads(self.rfile.read(n) or b"{}")
         except Exception:
             self._send(400, {"ok": False, "error": "bad json"})

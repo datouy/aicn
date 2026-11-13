@@ -18,6 +18,9 @@ from . import cli
 #: POST 请求体上限（1MB）。面板只收几个表单字段，正常远小于此值；
 #: 限制是为了防止异常/恶意的大请求体占满内存。
 MAX_BODY = 1024 * 1024
+#: 耗时接口（联网探测/生成/同步）的并发上限，避免用户在浏览器里连续点击堆积线程。
+_RUN_SEMAPHORE = threading.BoundedSemaphore(2)
+_RATE_LIMITED_APIS = {"test", "gen", "sync", "doctor"}
 
 HTML = r"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -139,14 +142,18 @@ async function runEnv(){const r=await api('env',{provider:$('e-provider').value}
 bindModel('t-model','t-model-custom');bindModel('g-model','g-model-custom');
 loadProviders();loadList();
 </script></body></html>"""
+HTML_BYTES = HTML.encode("utf-8")
 
 
-def _run(fn, ns) -> dict:
+def _run(fn, ns, timeout: int = 120) -> dict:
     """在线程中执行 cli 命令函数，捕获异常与退出码。
 
     不使用 contextlib.redirect_stdout —— 那会改写进程级全局的 sys.stdout，
     在 ThreadingHTTPServer 的并发请求下会把 A 请求的输出（含密钥）串到 B 响应里。
     cli 的命令函数一律以返回值传递文本，副作用（写文件）由调用方处理。
+
+    网络请求由 cli.http_request 的 timeout 兜底（sync/test 15s、doctor 探测 4s），
+    因此单条命令不会长时间悬挂；这里的 timeout 只是防御性上限。
     """
     box: dict = {}
 
@@ -168,9 +175,9 @@ def _run(fn, ns) -> dict:
 
     th = threading.Thread(target=worker, daemon=True)
     th.start()
-    th.join(timeout=600)
+    th.join(timeout=timeout)
     if th.is_alive():
-        box["note"] = "任务仍在后台执行,超 600s 未返回。"
+        box["note"] = "任务仍在后台执行,超 %ds 未返回。" % timeout
     out = str(box.get("out", ""))
     exit_code = box.get("exit", 0)
     return {"ok": box.get("error") is None and exit_code == 0,
@@ -178,10 +185,21 @@ def _run(fn, ns) -> dict:
             "note": box.get("note", ""), "out": out.strip()}
 
 
+_providers_snapshot: dict | None = None
+_providers_snapshot_key: tuple | None = None
+
+
 def api_providers() -> dict:
-    data = cli.load_providers()
-    return {"ok": True, "providers": data["providers"],
-            "price_updated": data.get("price_updated", "")}
+    """返回供应商清单。页面每次加载都会调用，缓存只读快照避免重复 deepcopy。"""
+    global _providers_snapshot, _providers_snapshot_key
+    key = cli._providers_mtime_key()
+    if _providers_snapshot is None or key != _providers_snapshot_key:
+        data = cli.load_providers()
+        _providers_snapshot = {"providers": data["providers"],
+                               "price_updated": data.get("price_updated", "")}
+        _providers_snapshot_key = key
+    return {"ok": True, "providers": _providers_snapshot["providers"],
+            "price_updated": _providers_snapshot["price_updated"]}
 
 
 def api_list(body: dict) -> dict:
@@ -257,8 +275,12 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def _send(self, code, body, ctype="application/json; charset=utf-8"):
-        data = body.encode("utf-8") if isinstance(body, str) else \
-            json.dumps(body, ensure_ascii=False).encode("utf-8")
+        if isinstance(body, bytes):
+            data = body
+        elif isinstance(body, str):
+            data = body.encode("utf-8")
+        else:
+            data = json.dumps(body, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
@@ -267,8 +289,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path in ("/", "/index.html"):
-            page = HTML.replace("__PORT__", str(self.port)) \
-                       .replace("__LLMBENCH_URL__", self.llmbench_url)
+            page = HTML_BYTES \
+                .replace(b"__PORT__", str(self.port).encode("ascii")) \
+                .replace(b"__LLMBENCH_URL__", self.llmbench_url.encode("ascii"))
             self._send(200, page, "text/html; charset=utf-8")
             return
         if self.path == "/api/providers":
@@ -292,20 +315,32 @@ class Handler(BaseHTTPRequestHandler):
             raw_len = self.headers.get("Content-Length")
             n = int(raw_len) if raw_len is not None else 0
         except (TypeError, ValueError):
+            self.close_connection = True
             self._send(400, {"ok": False, "error": "bad content-length"})
             return
         if n < 0 or n > MAX_BODY:
+            self.close_connection = True
             self._send(413, {"ok": False, "error": "body too large"})
             return
         try:
             body = json.loads(self.rfile.read(n) or b"{}")
         except Exception:
+            self.close_connection = True
             self._send(400, {"ok": False, "error": "bad json"})
             return
+        acquired = False
+        if name in _RATE_LIMITED_APIS:
+            if not _RUN_SEMAPHORE.acquire(blocking=False):
+                self._send(429, {"ok": False, "error": "系统繁忙，请稍后重试"})
+                return
+            acquired = True
         try:
             self._send(200, fn(body))
         except Exception as exc:
             self._send(500, {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)})
+        finally:
+            if acquired:
+                _RUN_SEMAPHORE.release()
 
 
 def cmd_web(args: argparse.Namespace) -> int:

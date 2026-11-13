@@ -27,6 +27,7 @@ import threading
 import time
 import unicodedata
 import urllib.error
+import urllib.parse
 import urllib.request
 from functools import lru_cache
 from pathlib import Path
@@ -145,6 +146,9 @@ def column_widths(rows: list[list[str]], headers: list[str],
 #: 每个 /api 请求各调一次）。按两个数据文件的 mtime 做失效判断，避免重复读盘 + 解析。
 _providers_cache: dict | None = None
 _providers_cache_key: tuple | None = None
+#: 保护缓存读写：ThreadingHTTPServer 并发下多个线程可能同时进入 load_providers，
+#: 避免缓存键与缓存值在更新瞬间被另一线程读到不一致的状态。
+_providers_lock = threading.Lock()
 
 
 def _providers_mtime_key() -> tuple:
@@ -165,23 +169,24 @@ def load_providers() -> dict:
     同步来的模型列表。用户级文件只覆盖 model 条目，不改动价格等基线字段。
     """
     global _providers_cache, _providers_cache_key
-    key = _providers_mtime_key()
-    if _providers_cache is not None and key == _providers_cache_key:
-        return copy.deepcopy(_providers_cache)
-    if not DATA_FILE.exists():
-        raise AicnError("找不到数据文件 %s" % DATA_FILE)
-    with open(DATA_FILE, encoding="utf-8") as fh:
-        data = json.load(fh)
-    schema = data.get("schema_version")
-    if schema is not None and schema != SUPPORTED_SCHEMA_VERSION:
-        raise AicnError("数据文件 schema_version=%s 与当前 aicn 支持的 %d 不兼容，请升级 aicn。"
-                        % (schema, SUPPORTED_SCHEMA_VERSION))
-    overlay = load_user_overlay()
-    if overlay:
-        _apply_overlay(data, overlay)
-    _providers_cache = data
-    _providers_cache_key = key
-    return copy.deepcopy(data)
+    with _providers_lock:
+        key = _providers_mtime_key()
+        if _providers_cache is not None and key == _providers_cache_key:
+            return copy.deepcopy(_providers_cache)
+        if not DATA_FILE.exists():
+            raise AicnError("找不到数据文件 %s" % DATA_FILE)
+        with open(DATA_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+        schema = data.get("schema_version")
+        if schema is not None and schema != SUPPORTED_SCHEMA_VERSION:
+            raise AicnError("数据文件 schema_version=%s 与当前 aicn 支持的 %d 不兼容，请升级 aicn。"
+                            % (schema, SUPPORTED_SCHEMA_VERSION))
+        overlay = load_user_overlay()
+        if overlay:
+            _apply_overlay(data, overlay)
+        _providers_cache = data
+        _providers_cache_key = key
+        return copy.deepcopy(data)
 
 
 def load_user_overlay() -> dict:
@@ -251,6 +256,27 @@ def http_request(url: str, method: str = "GET", headers: dict | None = None,
         return err.code, round((time.time() - started) * 1000), err.read().decode("utf-8", "replace")
     except Exception as err:  # URLError / 超时 / 连接失败
         return None, round((time.time() - started) * 1000), str(err)
+
+
+def validate_base_url(value: str | None) -> None:
+    """校验用户覆盖的 base URL：只允许 http/https，主机名非空，端口合法。
+
+    用户可通过 --base-url 传入任意字符串，若不校验，ftp:// 或畸形 URL 会进入
+    请求层，报错可读性差；这里在入口统一拦截，给出明确错误。
+    """
+    if value is None or value == "":
+        return
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.scheme not in ("http", "https"):
+        raise AicnError("base URL 只支持 http/https：%r" % value)
+    if not parsed.hostname:
+        raise AicnError("base URL 缺少主机名：%r" % value)
+    try:
+        port = parsed.port
+    except ValueError as err:
+        raise AicnError("base URL 端口非法：%r" % value) from err
+    if port is not None and not (0 < port < 65536):
+        raise AicnError("base URL 端口非法：%r" % value)
 
 
 def read_key(provider: dict, key_arg: str | None) -> str | None:
@@ -425,6 +451,7 @@ def cmd_test(args) -> CommandOutput:
     provider = require_provider(data, args.provider)
     model = pick_model(provider, args.model)
     key = resolve_key(args, provider)
+    validate_base_url(getattr(args, "base_url", None))
     lines = ["测试供应商 %s 模型 %s（协议 %s）..." % (provider["name"], model, args.protocol)]
     if not key:
         lines.append("提示：未提供 API Key（--key 或环境变量 %s），结果可能是 401。" % provider.get("env_key"))
@@ -573,47 +600,49 @@ def build_claude_settings(existing: str | None, base_url: str, model: str, key: 
 _write_lock = threading.Lock()
 
 
+def _atomic_replace(path: Path, content: str, mode: int | None) -> None:
+    """原子写：临时文件 + os.replace，失败时清理临时文件，不留 .tmp 残留。"""
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        tmp_path.write_text(content, encoding="utf-8")
+        if mode is not None:
+            os.chmod(tmp_name, mode)
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def write_with_backup(path: Path, content: str) -> str:
-    """原子地写入文件（先备份原文件），返回一条人类可读的状态消息。
+    """原子地写入文件（先原子备份原文件），返回一条人类可读的状态消息。
 
     不直接 print —— Web 面板在多线程下调用本函数，直接 print 会与其它请求的
     输出交错（stdout 是进程级全局资源）。消息由调用方决定如何呈现。
 
-    先写同目录临时文件再 os.replace，避免进程崩溃/断电/并发写入留下半截文件；
-    并保留原文件权限。写入失败（目录无写权限、磁盘满、路径被占用）时抛 AicnError
-    而不是裸的 OSError —— 否则 CLI 会打印一整屏 traceback，Web 面板也只能显示
-    "PermissionError: ..." 这种没有上下文的文本。
+    备份与目标文件都走临时文件 + os.replace，避免进程崩溃/断电/并发写入留下半截文件；
+    备份继承原文件权限（例如 600），避免把含密钥的配置备份成默认权限的可读文件。
+    写入失败（目录无写权限、磁盘满、路径被占用）时抛 AicnError 而不是裸 OSError。
     """
     message = ""
     with _write_lock:
         try:
             parent = path.parent
             parent.mkdir(parents=True, exist_ok=True)
-            if path.exists():
-                backup = path.with_name(path.name + ".aicn.bak")
-                backup.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
-                message = "[备份] 原文件已备份到 %s" % backup
-            # os.replace 会换 inode，需手动保留原文件权限（如 600），避免变成默认 umask。
             mode = None
             if path.exists():
                 try:
                     mode = path.stat().st_mode & 0o7777
                 except OSError:
                     mode = None
-            fd, tmp_name = tempfile.mkstemp(dir=str(parent), prefix=path.name + ".", suffix=".tmp")
-            os.close(fd)
-            tmp_path = Path(tmp_name)
-            try:
-                tmp_path.write_text(content, encoding="utf-8")
-                if mode is not None:
-                    os.chmod(tmp_name, mode)
-                os.replace(tmp_name, path)
-            except BaseException:
-                try:
-                    tmp_path.unlink()
-                except OSError:
-                    pass
-                raise
+                backup = path.with_name(path.name + ".aicn.bak")
+                _atomic_replace(backup, path.read_text(encoding="utf-8"), mode)
+                message = "[备份] 原文件已备份到 %s" % backup
+            _atomic_replace(path, content, mode)
         except OSError as err:
             raise AicnError("写入 %s 失败：%s\n请检查该目录的写权限。" % (path, err),
                             code=1) from err
@@ -664,6 +693,7 @@ def cline_guide(provider: dict, model: str) -> str:
 def cmd_gen(args) -> str:
     data = load_providers()
     provider = dict(require_provider(data, args.provider))
+    validate_base_url(getattr(args, "base_url", None))
     # 用户显式传入的 --base-url 覆盖所有协议的默认基址 —— 否则指向自建网关时
     # 供应商自己的端点（如智谱的 /api/v1）会盖过用户的选择。
     override = getattr(args, "base_url", None)
@@ -791,6 +821,10 @@ def sync_models(provider_id: str, base_url: str | None = None, key: str | None =
     写入的是用户级文件（默认 ~/.aicn/providers.json），不会改动包内或仓库里的数据文件。
     """
     data = load_providers()
+    try:
+        validate_base_url(base_url)
+    except AicnError as err:
+        return {"ok": False, "error": str(err)}
     provider = data["providers"].get(provider_id)
     if not provider:
         return {"ok": False, "error": "未知供应商 %s（可用：%s）"
@@ -865,7 +899,7 @@ def probe_endpoint(pid: str, provider: dict) -> tuple:
     headers = {"User-Agent": "aicn-doctor"}
     if key:
         headers["Authorization"] = "Bearer " + key
-    status, ms, _ = http_request(url, "GET", headers, timeout=6)
+    status, ms, _ = http_request(url, "GET", headers, timeout=4)
     if status is None:
         return pid, "不可达", ms, "down"
     if status >= 500:

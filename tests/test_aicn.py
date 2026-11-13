@@ -1104,7 +1104,7 @@ class TestWebConcurrency(unittest.TestCase):
         th = threading.Thread(target=srv.serve_forever, daemon=True)
         th.start()
         try:
-            threads = [threading.Thread(target=worker, args=(i,)) for i in range(6)]
+            threads = [threading.Thread(target=worker, args=(i,)) for i in range(2)]
             for t in threads:
                 t.start()
             for t in threads:
@@ -1115,11 +1115,11 @@ class TestWebConcurrency(unittest.TestCase):
             gateway.shutdown()
             gateway.server_close()
 
-        self.assertEqual(len(results), 6)
+        self.assertEqual(len(results), 2)
         for i, payload in results:
             out = payload.get("out", "")
             self.assertIn("model-marker-%d" % i, out)
-            for j in range(6):
+            for j in range(2):
                 if j != i:
                     self.assertNotIn("model-marker-%d" % j, out,
                                      "响应 %d 串入了请求 %d 的内容" % (i, j))
@@ -1223,3 +1223,194 @@ class TestCliBaseUrlOverride(unittest.TestCase):
             write=False, wire_api=None, base_url="http://127.0.0.1:9999/v1"))
         self.assertIn('base_url = "http://127.0.0.1:9999/v1"', out)
         self.assertNotIn("open.bigmodel.cn", out)
+
+
+class TestBaseUrlValidation(unittest.TestCase):
+    """用户覆盖的 base URL 只允许 http/https，主机名非空，端口合法。"""
+
+    def test_accepts_http_https_and_empty(self):
+        from aicn import cli
+        cli.validate_base_url("http://127.0.0.1:8080/v1")
+        cli.validate_base_url("https://api.deepseek.com")
+        cli.validate_base_url(None)
+        cli.validate_base_url("")
+
+    def test_rejects_ftp(self):
+        from aicn import cli
+        with self.assertRaises(cli.AicnError):
+            cli.validate_base_url("ftp://example.com/v1")
+
+    def test_rejects_missing_host(self):
+        from aicn import cli
+        with self.assertRaises(cli.AicnError):
+            cli.validate_base_url("http:///v1")
+
+    def test_rejects_bad_port(self):
+        from aicn import cli
+        with self.assertRaises(cli.AicnError):
+            cli.validate_base_url("http://example.com:99999/v1")
+
+    def test_sync_rejects_invalid_base_url(self):
+        from aicn import cli
+        res = cli.sync_models("deepseek", "ftp://example.com/v1", "k")
+        self.assertFalse(res["ok"])
+        self.assertIn("http", res["error"])
+
+    def test_gen_rejects_invalid_base_url(self):
+        from aicn import cli
+        ns = argparse_namespace(tool="codex", provider="qwen", model=None, key=None,
+                                write=False, wire_api=None, base_url="ftp://x/v1")
+        with self.assertRaises(cli.AicnError):
+            cli.cmd_gen(ns)
+
+    def test_test_rejects_invalid_base_url(self):
+        from aicn import cli
+        ns = argparse_namespace(provider="deepseek", model=None, key="k",
+                                protocol="chat", base_url="ftp://x/v1")
+        with self.assertRaises(cli.AicnError):
+            cli.cmd_test(ns)
+
+
+class TestWriteAtomic(unittest.TestCase):
+    def test_no_tmp_leftover_after_failed_write(self):
+        from aicn import cli
+        original = Path.write_text
+
+        def boom(self, *a, **k):
+            raise PermissionError(13, "Permission denied", str(self))
+
+        Path.write_text = boom
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                target = Path(td) / "config.toml"
+                with self.assertRaises(cli.AicnError):
+                    cli.write_with_backup(target, "new")
+                leftovers = [p for p in Path(td).iterdir() if p.suffix == ".tmp"]
+                self.assertEqual(leftovers, [])
+        finally:
+            Path.write_text = original
+
+    def test_backup_preserves_content(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "config.toml"
+            path.write_text("old", encoding="utf-8")
+            aicn.write_with_backup(path, "new")
+            backup = Path(td) / "config.toml.aicn.bak"
+            self.assertTrue(backup.exists())
+            self.assertEqual(backup.read_text(encoding="utf-8"), "old")
+            self.assertEqual(path.read_text(encoding="utf-8"), "new")
+
+
+class TestConcurrentLoad(unittest.TestCase):
+    def test_concurrent_load_providers_consistent(self):
+        import threading
+        results = []
+        lock = threading.Lock()
+
+        def worker():
+            for _ in range(10):
+                d = aicn.load_providers()
+                with lock:
+                    results.append(len(d["providers"]))
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertTrue(results)
+        self.assertEqual(len(set(results)), 1)
+        self.assertGreater(results[0], 0)
+
+
+class TestWebHardening(unittest.TestCase):
+    """POST 请求体防护 + 耗时接口并发上限。"""
+
+    def _post(self, name, body=b"{}", content_length=None):
+        import io
+
+        from aicn import webui
+
+        class FakeHandler(webui.Handler):
+            def __init__(self, path, headers, body):
+                self.path = path
+                self.headers = headers
+                self.rfile = io.BytesIO(body)
+                self.close_connection = False
+                self.responses = []
+
+            def _send(self, code, resp_body, ctype="application/json; charset=utf-8"):
+                self.responses.append((code, resp_body))
+
+        headers = {}
+        if content_length is not None:
+            headers["Content-Length"] = content_length
+        h = FakeHandler("/api/" + name, headers, body)
+        h.do_POST()
+        return h
+
+    def test_oversized_body_returns_413(self):
+        from aicn import webui
+        h = self._post("list", content_length=str(webui.MAX_BODY + 1))
+        self.assertEqual(h.responses[0][0], 413)
+        self.assertTrue(h.close_connection)
+
+    def test_bad_content_length_returns_400(self):
+        h = self._post("list", content_length="abc")
+        self.assertEqual(h.responses[0][0], 400)
+        self.assertTrue(h.close_connection)
+
+    def test_bad_json_returns_400(self):
+        h = self._post("list", body=b"not-json", content_length="8")
+        self.assertEqual(h.responses[0][0], 400)
+        self.assertTrue(h.close_connection)
+
+    def test_run_semaphore_limits_concurrency(self):
+        from aicn import webui
+        slots = [webui._RUN_SEMAPHORE.acquire(blocking=False) for _ in range(3)]
+        try:
+            self.assertTrue(all(slots[:2]))
+            self.assertFalse(slots[2])
+        finally:
+            for acquired in slots[:2]:
+                if acquired:
+                    webui._RUN_SEMAPHORE.release()
+
+    def test_rate_limited_api_returns_429_when_busy(self):
+        from aicn import webui
+        a = webui._RUN_SEMAPHORE.acquire(blocking=False)
+        b = webui._RUN_SEMAPHORE.acquire(blocking=False)
+        self.assertTrue(a and b)
+        try:
+            h = self._post("test", body=b"{}", content_length="2")
+            self.assertEqual(h.responses[0][0], 429)
+        finally:
+            webui._RUN_SEMAPHORE.release()
+            webui._RUN_SEMAPHORE.release()
+
+
+class TestPageBytes(unittest.TestCase):
+    def test_page_precomputed_bytes(self):
+        from aicn import webui
+        self.assertTrue(webui.HTML_BYTES.startswith(b"<!doctype html>"))
+        self.assertIn(b"__PORT__", webui.HTML_BYTES)
+        self.assertIn(b"__LLMBENCH_URL__", webui.HTML_BYTES)
+
+
+class TestDoctorTimeout(unittest.TestCase):
+    def test_probe_uses_short_timeout(self):
+        from aicn import cli
+        captured = {}
+        original = cli.http_request
+
+        def fake(url, method="GET", headers=None, timeout=15):
+            captured["timeout"] = timeout
+            return (200, 5, "")
+
+        cli.http_request = fake
+        try:
+            cli.probe_endpoint("x", {"base_url": "https://example.invalid", "env_key": "K"})
+        finally:
+            cli.http_request = original
+        self.assertEqual(captured["timeout"], 4)
+

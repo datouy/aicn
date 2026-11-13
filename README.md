@@ -174,6 +174,15 @@ python -m aicn web --port 9000
 - 写入配置前自动备份为 `*.aicn.bak`;Config files are backed up before any write;
 - 只有你主动运行 `test` 时才发起网络请求,其余命令全部本地执行。Network requests only happen when you run `test`.
 
+## 🛡️ 稳定性与性能 · Reliability
+
+- **原子写入**：配置与备份都先写同目录临时文件再 `os.replace`，进程崩溃 / 断电 / 并发写入都不会留下半截文件；备份继承原文件权限，避免把含密钥的配置备份成默认权限的可读文件。
+- **base_url 校验**：`--base-url` 只允许 `http/https`，主机名与端口必须合法，`ftp://` 或畸形 URL 会在发起请求前被明确拦截（gen / test / sync 统一校验）。
+- **请求体上限**：Web 面板把 POST 请求体限制为 1MB，超限返回 413、非法 Content-Length 返回 400，并关闭连接避免残留字节被误当成下一条请求。
+- **并发上限**：耗时接口（test / gen / sync / doctor）最多同时执行 2 个，超出返回 429，避免在浏览器里连续点击堆积线程。
+- **缓存一致性**：供应商数据缓存加进程内锁保护并发读写；Web 面板缓存只读快照，避免每次请求重复深拷贝。
+- **doctor 更快**：单端点探测超时从 6s 降到 4s，401/403/404 立即返回。
+
 ## ❓ FAQ
 
 **Q:为什么 Claude Code 不能直接接豆包?** Claude Code 只讲 Anthropic 协议。方案:a) 用 DeepSeek / Kimi / GLM 编码套餐 / 百炼 / SiliconFlow 的 anthropic 端点;b) 本地架设 claude-code-router 做协议转换。
